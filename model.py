@@ -10,6 +10,7 @@ from flax import traverse_util
 
 from dataclasses import dataclass
 from typing import Optional, Any, Tuple
+from functools import partial
 
 @dataclass
 class LLAMAConfig:
@@ -134,14 +135,13 @@ class LLAMA(nn.Module):
         self.h = [Block(config) for _ in range(config.n_layer)]
         self.ln_f = nn.LayerNorm()
         self.projection = nn.Dense(config.vocab_size, use_bias=False)
-
+    
     def __call__(self, idx: jax.Array, *, train: bool,  mask: Optional[jax.Array]=None, targets: Optional[jax.Array]=None):
         b, t = idx.shape
         assert t <= self.config.block_size
         pos = jnp.arange(0, t, dtype=jnp.int32)[None]
 
         tok_emb = self.wte(idx)
-        print(tok_emb)
         # TODO: implement RoPE
         # pos_emb = self.wpe(pos)
         # print(pos_emb)
@@ -234,43 +234,75 @@ class LLAMA(nn.Module):
 
         return tx
 
-    def generate(self, key, params, input_tokens, max_new_tokens, temp=1.0, top_k=None):
+    # @partial(jax.jit, static_argnames=("self", "length"))
+    def generate_jit(self, key, params, input_tokens, max_new_tokens, temperature=1.0, top_k=None):
+        """
+        Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
+        the sequence max_new_tokens times, feeding the predictions back into the model each time.
+        Most likely you'll want to make sure to be in model.eval() mode of operation for this.
+        """
         B, T = input_tokens.shape
         padding = jnp.zeros((B, max_new_tokens), dtype=jnp.int32)
         tokens = jnp.concatenate([input_tokens, padding], axis=-1)
+        indexes = jnp.arange(T, T + max_new_tokens)
 
-        indexes = jnp.arange(T, T+max_new_tokens)
-
+        # tokens index -> tokens None
         def scan_f(tokens, i):
-            # t: a b - - 
-            # i: 0 1 2 3 
-            # JAX make random state key
+            # l: x y
+            # t: a b - -
+            # i: 0 1 2 3
             step_key = jax.random.fold_in(key, i)
-
-            # when exceed the max block size and crop it
-            tokens = tokens if tokens.shape[1] <= self.config.block_size else tokens[:, -self.config.block_size:]
-
-            # get token probability distribution
-            logits, _ = self.apply({"params": params}, tokens, train=False)
-            logits = logits[:, i-1, :] / temp
-            print(logits)
-
+            # if the sequence context is growing too long we must crop it at block_size
+            # idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
+            # forward the model to get the logits for the index in the sequence
+            logits, _ = self.apply({'params': params}, tokens, train=False)
+            # pluck the logits at the final step and scale by desired temperature
+            logits = logits[:, i - 1, :] / temperature
+            # optionally crop the logits to only the top k options
+            # sample from the distribution
             if top_k is not None:
                 top_logits, top_tokens = jax.lax.top_k(logits, min(top_k, logits.shape[-1]))
-                # identical with torch multinomial
                 token_idx = jax.random.categorical(step_key, top_logits, axis=-1)
                 next_token = jnp.take_along_axis(top_tokens, token_idx[:, None], axis=-1).squeeze(-1)
             else:
                 next_token = jax.random.categorical(step_key, logits, axis=-1)
-
-            # append sampled index to the running sequece and continue
+                # logits = jnp.where(logits < v[:, -1:], float('-inf'), logits)
+            # append sampled index to the running sequence and continue
             tokens = tokens.at[:, i].set(next_token)
 
             return tokens, None
 
-        # for _ in range(max_new_tokens):       
         tokens, _ = jax.lax.scan(scan_f, tokens, indexes)
-            # print(tokens)
 
         return tokens
 
+    def generate(self, random_key, params, context, length, temp=1.0, top_k=None):
+        if context.shape[-1] > self.config.block_size:
+            context = context[:, -self.config.block_size]
+        logits, _ = self.apply({"params":params}, context, train=False)    
+        random_key, random_subkey = jax.random.split(random_key)
+        new_token = jax.random.categorical(random_subkey, logits[:, -1, :], axis=-1, shape=(1, 1))
+        context = jnp.concatenate([context, new_token], axis=1)
+
+        return context
+
+    def create_state(
+        self, learning_rate, weight_decay, beta1, beta2,
+        decay_lr=None, warmup_iters=None, lr_decay_iters=None, min_lr=None, params=None, **kwargs
+    ):
+        if params is None:
+            variables = self.init(jax.random.PRNGKey(0), jnp.ones((1,1), dtype=jnp.int32), train=False)
+            params = variables["params"]
+        if decay_lr:
+            assert warmup_iters is not None and lr_decay_iters is not None and min_lr is not None
+            lr_scheduler = optax.warmup_cosine_decay_schedule(
+                init_value=0.0, peak_value=learning_rate, warmup_steps=warmup_iters, decay_steps=lr_decay_iters, end_value=min_lr
+            )
+        else:
+            lr_scheduler = learning_rate
+
+        tx = self.configure_optimizers(
+            params, weight_decay=weight_decay, learning_rate=lr_scheduler, betas=(beta1, beta2)
+        )
+        return train_state.TrainState.create(apply_fn=self.apply, params=params, tx=tx)
+        

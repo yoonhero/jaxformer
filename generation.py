@@ -24,6 +24,7 @@ if __name__ == "__main__":
     parser.add_argument("--model_path", type=str, default="./tmp/model.pt")
     parser.add_argument("--chat", action="store_true")
     parser.add_argument("--context", action="store_true")
+    parser.add_argument("--info", action="store_true")
     args = parser.parse_args()
 
     model_path = Path(args.model_path)
@@ -31,7 +32,8 @@ if __name__ == "__main__":
 
     key = jax.random.PRNGKey(0)
     idx = jnp.ones((1, 10), dtype=jnp.int32)
-    print(model.tabulate(key, idx, train=False, depth=1))
+    if args.info:
+        print(model.tabulate(key, idx, train=False, depth=1))
 
     # Loading the tokenizer.
     tokenizer = AutoTokenizer.from_pretrained("tokenizer")
@@ -43,14 +45,14 @@ if __name__ == "__main__":
 
     chat_parser = (
         "명령어에 따른 요청을 적절히 완료하는 응답을 작성하세요.\n\n"
-        "### 명령어:\n{instruction}\n\n### 응답:"
+        "### 명령어:\n{instruction}\n\n### 응답:\n"
     )
 
     @jax.jit
     def _sample(params, key, tokens) -> jax.Array:
         # with jax.profiler.trace("/tmp/jax-trace", create_perfetto_link=True):
-        result = model.generate(
-            key, params, tokens, max_new_tokens=200, top_k=5, temp=0.8
+        result = model.generate_jit(
+            key, params, tokens, max_new_tokens=10, top_k=5, temperature=0.8
         )
             # result.block_until_read()
         return result
@@ -58,7 +60,10 @@ if __name__ == "__main__":
     def sample(params, key, tokens) -> str:
         token = _sample(params, key, tokens)
         target = tokenizer.decode(token[0])
-        return target
+        return target, token
+
+    # JIT 
+    sample(params, key, jnp.ones((1, 1), dtype=jnp.int32))
 
     user_prompt = input(">>> ")
 
@@ -66,12 +71,14 @@ if __name__ == "__main__":
     user_prompt = f"{SOS_TOKEN} {user_prompt}"
 
     idx = tokenizer.encode(user_prompt)
-    token = jnp.array([idx], dtype=jnp.int32)
+    token = jnp.array([idx], dtype=jnp.int32)   
     print(token)
 
     num_samples=10
+    start = time.time()
     for k in range(num_samples):
         step_key = jax.random.fold_in(key, k)
-        print(step_key)
-        sampled_str = sample(params, key, token)
-        print(sampled_str)
+        sampled_str, token= sample(params, key, token)
+
+    print(sampled_str)
+    print(f"Finished in {time.time() - start}")
